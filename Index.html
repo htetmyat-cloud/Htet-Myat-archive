@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>The Manga Archive - Your Digital Library</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Custom font import and application */
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #111827; /* Dark Slate Gray */
+        }
+        .text-red-glow {
+            text-shadow: 0 0 5px rgba(239, 68, 68, 0.5); /* Subtle red glow */
+        }
+        .card-bg {
+            background-color: #1f2937; /* Slightly lighter dark gray for cards */
+        }
+        .manga-card-wrapper:hover .delete-btn {
+            opacity: 1;
+        }
+        .delete-btn {
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+        @media (max-width: 768px) {
+            .delete-btn {
+                opacity: 1; /* Always show delete button on mobile */
+            }
+        }
+    </style>
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, addDoc, onSnapshot, collection, serverTimestamp, setLogLevel, deleteDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        setLogLevel('Debug');
+
+        // Global variables provided by the Canvas environment
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let app, db, auth;
+        window.userId = null;
+        window.allMangaData = []; // Global storage for all fetched manga data
+        window.currentFilter = 'All'; // Current active filter
+
+        try {
+            // 1. Initialize Firebase
+            app = initializeApp(firebaseConfig);
+            db = getFirestore(app);
+            auth = getAuth(app);
+
+            // 2. Authentication Logic
+            if (initialAuthToken) {
+                signInWithCustomToken(auth, initialAuthToken).catch(e => signInAnonymously(auth));
+            } else {
+                signInAnonymously(auth);
+            }
+
+            // 3. Auth State Listener
+            onAuthStateChanged(auth, (user) => {
+                if (user) {
+                    window.userId = user.uid;
+                    const displayElement = document.getElementById('user-id-display');
+                    if(displayElement) {
+                        displayElement.innerText = `User ID: ${window.userId.substring(0, 8)}...`;
+                        displayElement.title = window.userId;
+                    }
+                    listenForMangaData();
+                }
+            });
+
+        } catch (e) {
+            console.error("Error during Firebase setup:", e);
+        }
+        
+        // --- FIRESTORE DATA & RENDERING FUNCTIONS ---
+
+        // Public Collection Path: /artifacts/{appId}/public/data/manga_titles
+        const getCollectionRef = () => collection(db, `artifacts/${appId}/public/data/manga_titles`);
+
+        /**
+         * Listens for real-time changes to the manga collection, stores the data, and triggers a UI render.
+         */
+        function listenForMangaData() {
+            if (!db) return;
+            
+            const mangaContainer = document.getElementById('manga-grid');
+            if (!mangaContainer) return;
+
+            onSnapshot(getCollectionRef(), (snapshot) => {
+                window.allMangaData = [];
+                snapshot.forEach(doc => {
+                    window.allMangaData.push({ id: doc.id, ...doc.data() });
+                });
+                
+                // Re-apply the current filter after fetching new data
+                filterManga(window.currentFilter); 
+
+            }, (error) => {
+                console.error("Error listening to manga data:", error);
+                mangaContainer.innerHTML = `<p class="text-center text-red-500 col-span-full py-10">Error loading data: ${error.message}</p>`;
+            });
+        }
+        
+        /**
+         * Filters the global manga data by genre and updates the UI.
+         * @param {string} genre - The genre to filter by, or 'All'.
+         */
+        window.filterManga = function(genre) {
+            window.currentFilter = genre;
+            const genreButtons = document.querySelectorAll('.genre-btn');
+            
+            // Highlight the active button
+            genreButtons.forEach(btn => {
+                const btnText = btn.innerText.trim();
+                if (btnText === genre) {
+                    btn.classList.add('bg-red-600', 'hover:bg-red-700');
+                    btn.classList.remove('bg-gray-700', 'hover:bg-red-600');
+                } else {
+                    btn.classList.add('bg-gray-700', 'hover:bg-red-600');
+                    btn.classList.remove('bg-red-600', 'hover:bg-red-700');
+                }
+            });
+
+            let filteredData;
+            if (genre === 'All') {
+                filteredData = window.allMangaData;
+            } else {
+                // Local filtering (case-insensitive and trimmed)
+                filteredData = window.allMangaData.filter(manga => 
+                    manga.genre && manga.genre.trim().toLowerCase() === genre.trim().toLowerCase().replace('-', ' ')
+                );
+            }
+            
+            renderMangaGrid(filteredData);
+        }
+
+        /**
+         * Renders the manga list into the grid container.
+         * @param {Array} data - The list of manga objects to render.
+         */
+        function renderMangaGrid(data) {
+            const mangaContainer = document.getElementById('manga-grid');
+            mangaContainer.innerHTML = '';
+            
+            if (data.length === 0) {
+                mangaContainer.innerHTML = '<p class="text-center text-gray-400 col-span-full py-10">No manga titles match this filter. Try uploading one!</p>';
+                return;
+            }
+            
+            data.forEach(manga => {
+                mangaContainer.innerHTML += createMangaCard(manga);
+            });
+        }
+        
+        /**
+         * Creates the HTML structure for a single manga card.
+         * Includes the delete button logic.
+         * @param {Object} manga - The manga document data.
+         */
+        function createMangaCard(manga) {
+            const title = manga.title || 'Untitled';
+            const author = manga.author || 'Unknown Author';
+            const genre = manga.genre || 'General';
+            const coverUrl = manga.coverUrl || 'https://placehold.co/200x300/3e3e3e/ffffff?text=NO+COVER';
+            const uploader = (manga.uploaderId || 'Anon').substring(0, 5);
+
+            return `
+                <div class="card-bg rounded-lg shadow-xl overflow-hidden hover:shadow-red-500/50 transition duration-300 transform hover:scale-[1.02] relative manga-card-wrapper">
+                    <!-- Delete Button -->
+                    <button onclick="showConfirmModal('${manga.id}', '${title.replace(/'/g, "\\'")}')" 
+                        class="delete-btn absolute top-2 right-2 p-1 bg-red-700 text-white rounded-full z-10 shadow-lg hover:bg-red-800 transition duration-200">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                    </button>
+                    
+                    <img src="${coverUrl}" onerror="this.onerror=null; this.src='https://placehold.co/200x300/3e3e3e/ffffff?text=NO+COVER'" alt="${title} Cover" class="w-full h-auto object-cover border-b-2 border-red-500 aspect-[2/3]">
+                    <div class="p-3 text-center">
+                        <h3 class="text-md font-semibold text-white truncate">${title}</h3>
+                        <p class="text-red-400 text-sm">${genre} by ${author}</p>
+                        <p class="text-gray-500 text-xs mt-1">Uploaded by: ${uploader}...</p>
+                    </div>
+                </div>
+            `;
+        }
+
+        /**
+         * Deletes a manga title document from Firestore.
+         * @param {string} mangaId - The ID of the document to delete.
+         */
+        window.deleteMangaTitle = async function(mangaId) {
+            try {
+                const docRef = doc(db, `artifacts/${appId}/public/data/manga_titles`, mangaId);
+                await deleteDoc(docRef);
+                console.log(`Document ${mangaId} successfully deleted.`);
+            } catch (error) {
+                console.error("Error deleting document:", error);
+                // In a real app, you might show a temporary error message here.
+            }
+        }
+
+        // --- MODAL LOGIC (Upload and Confirmation) ---
+
+        /**
+         * Upload Modal Logic
+         */
+        function setupUploadModal() {
+            const uploadButton = document.getElementById('open-upload-modal');
+            const modal = document.getElementById('upload-modal');
+            const closeButton = document.getElementById('close-upload-modal');
+            const form = document.getElementById('upload-form');
+
+            uploadButton.addEventListener('click', () => {
+                modal.classList.remove('hidden');
+                document.getElementById('upload-status').classList.add('hidden');
+            });
+            
+            closeButton.addEventListener('click', () => {
+                modal.classList.add('hidden');
+                document.getElementById('upload-status').classList.add('hidden');
+                document.getElementById('upload-form').reset();
+            });
+
+            form.addEventListener('submit', handleMangaSubmission);
+        }
+
+        /**
+         * Handles the submission of the new manga form.
+         */
+        async function handleMangaSubmission(event) {
+            event.preventDefault();
+            
+            if (!window.userId) return;
+
+            const title = document.getElementById('manga-title').value.trim();
+            const author = document.getElementById('manga-author').value.trim();
+            const genre = document.getElementById('manga-genre').value.trim();
+            const coverUrl = document.getElementById('manga-cover-url').value.trim() || 'https://placehold.co/200x300/3e3e3e/ffffff?text=NO+COVER';
+            const submitButton = document.getElementById('submit-manga-btn');
+            const statusElement = document.getElementById('upload-status');
+            
+            if (!title || !author || !genre) {
+                statusElement.innerText = "Please fill in all required fields.";
+                statusElement.classList.remove('hidden');
+                return;
+            }
+
+            submitButton.disabled = true;
+            submitButton.innerText = 'Uploading...';
+            statusElement.classList.add('hidden');
+            
+            try {
+                await addDoc(getCollectionRef(), {
+                    title: title,
+                    author: author,
+                    genre: genre,
+                    coverUrl: coverUrl,
+                    uploaderId: window.userId,
+                    timestamp: serverTimestamp()
+                });
+
+                statusElement.innerText = "Successfully uploaded new title! Close and refresh to view.";
+                statusElement.className = 'block text-sm font-medium pt-2 text-green-400';
+                document.getElementById('upload-form').reset();
+                
+            } catch (error) {
+                statusElement.innerText = `Upload failed: ${error.message}`;
+                statusElement.className = 'block text-sm font-medium pt-2 text-red-400';
+            } finally {
+                submitButton.disabled = false;
+                submitButton.innerText = 'Submit Title';
+            }
+        }
+
+        /**
+         * Confirmation Modal Logic (for Deletion)
+         */
+        window.showConfirmModal = function(mangaId, mangaTitle) {
+            const modal = document.getElementById('confirm-modal');
+            const titleElement = document.getElementById('confirm-title');
+            const confirmButton = document.getElementById('confirm-delete-btn');
+            
+            // Set modal content
+            titleElement.innerHTML = `Are you sure you want to delete **${mangaTitle}**?`;
+            
+            // Set up confirmation button action
+            confirmButton.onclick = async () => {
+                modal.classList.add('hidden');
+                await window.deleteMangaTitle(mangaId);
+            };
+            
+            // Show modal
+            modal.classList.remove('hidden');
+        };
+
+        function setupConfirmModal() {
+            const modal = document.getElementById('confirm-modal');
+            const closeButton = document.getElementById('close-confirm-modal');
+            const cancelButton = document.getElementById('cancel-delete-btn');
+
+            const hideModal = () => modal.classList.add('hidden');
+            closeButton.addEventListener('click', hideModal);
+            cancelButton.addEventListener('click', hideModal);
+        }
+
+        // Run UI setup once the DOM is fully loaded
+        document.addEventListener('DOMContentLoaded', () => {
+            setupUploadModal();
+            setupConfirmModal();
+            // Mobile Menu Toggle
+            const button = document.getElementById('mobile-menu-button');
+            const menu = document.getElementById('mobile-menu');
+            button.addEventListener('click', () => menu.classList.toggle('hidden'));
+        });
+    </script>
+</head>
+<body>
+
+    <!-- Floating Upload Button -->
+    <button id="open-upload-modal" class="fixed bottom-6 right-6 bg-red-600 text-white p-4 rounded-full shadow-2xl hover:bg-red-700 transition duration-300 transform hover:scale-110 z-20">
+        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
+        <span class="sr-only">+ Upload Title</span>
+    </button>
+    
+    <!-- Upload Modal (Hidden by default) -->
+    <div id="upload-modal" class="fixed inset-0 bg-gray-900 bg-opacity-90 flex items-center justify-center hidden z-30 p-4">
+        <div class="card-bg w-full max-w-lg rounded-xl shadow-2xl p-6 relative">
+            <button id="close-upload-modal" class="absolute top-4 right-4 text-gray-400 hover:text-red-500 transition">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+            </button>
+            <h2 class="text-2xl font-bold text-red-500 mb-6 border-b border-gray-700 pb-2">Upload New Manga Title</h2>
+            <form id="upload-form" class="space-y-4">
+                <div>
+                    <label for="manga-title" class="block text-sm font-medium text-gray-300">Title</label>
+                    <input type="text" id="manga-title" required class="mt-1 block w-full p-3 border border-gray-600 rounded-md bg-gray-700 text-white focus:ring-red-500 focus:border-red-500">
+                </div>
+                <div>
+                    <label for="manga-author" class="block text-sm font-medium text-gray-300">Author</label>
+                    <input type="text" id="manga-author" required class="mt-1 block w-full p-3 border border-gray-600 rounded-md bg-gray-700 text-white focus:ring-red-500 focus:border-red-500">
+                </div>
+                <div>
+                    <label for="manga-genre" class="block text-sm font-medium text-gray-300">Genre</label>
+                    <input type="text" id="manga-genre" required class="mt-1 block w-full p-3 border border-gray-600 rounded-md bg-gray-700 text-white focus:ring-red-500 focus:border-red-500" placeholder="e.g., Action, Romance, Sci-Fi">
+                </div>
+                <div>
+                    <label for="manga-cover-url" class="block text-sm font-medium text-gray-300">Cover Image URL (Optional)</label>
+                    <input type="url" id="manga-cover-url" class="mt-1 block w-full p-3 border border-gray-600 rounded-md bg-gray-700 text-white focus:ring-red-500 focus:border-red-500" placeholder="Paste a direct image link here (e.g., https://placehold.co/200x300/...)">
+                    <p class="mt-1 text-xs text-gray-500">Note: For simplicity, please use a direct link to a cover image (e.g., a placeholder image).</p>
+                </div>
+                
+                <p id="upload-status" class="hidden text-sm font-medium pt-2"></p>
+
+                <button type="submit" id="submit-manga-btn" class="w-full bg-red-600 text-white font-semibold py-3 px-4 rounded-lg hover:bg-red-700 transition duration-300">
+                    Submit Title
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <!-- Confirmation Modal for Deletion (Hidden by default) -->
+    <div id="confirm-modal" class="fixed inset-0 bg-gray-900 bg-opacity-90 flex items-center justify-center hidden z-40 p-4">
+        <div class="card-bg w-full max-w-sm rounded-xl shadow-2xl p-6 relative text-center border-t-4 border-red-600">
+            <button id="close-confirm-modal" class="absolute top-4 right-4 text-gray-400 hover:text-red-500 transition">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+            </button>
+            <h3 class="text-xl font-bold text-white mb-2">Confirm Deletion</h3>
+            <p id="confirm-title" class="text-gray-400 mb-6">Are you sure you want to delete this title?</p>
+            
+            <div class="flex justify-center space-x-4">
+                <button id="cancel-delete-btn" class="bg-gray-700 text-white font-semibold py-2 px-4 rounded-lg hover:bg-gray-600 transition duration-300">
+                    Cancel
+                </button>
+                <button id="confirm-delete-btn" class="bg-red-600 text-white font-semibold py-2 px-4 rounded-lg hover:bg-red-700 transition duration-300">
+                    Yes, Delete it
+                </button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Navigation Bar -->
+    <header class="bg-gray-800 shadow-2xl sticky top-0 z-10">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex justify-between items-center h-16">
+                <!-- Logo -->
+                <a href="#" class="text-3xl font-extrabold text-red-500 text-red-glow">MANGA <span class="text-white">ARCHIVE</span></a>
+
+                <!-- Desktop Navigation Links -->
+                <nav class="hidden md:flex space-x-8">
+                    <a href="#featured" class="text-gray-300 hover:text-red-400 transition duration-150 font-medium">Featured</a>
+                    <a href="#genres" class="text-gray-300 hover:text-red-400 transition duration-150 font-medium">Genres</a>
+                    <a href="#" class="text-red-500 hover:text-red-400 transition duration-150 font-bold">My List</a>
+                </nav>
+
+                <!-- Mobile Menu Button -->
+                <button id="mobile-menu-button" class="md:hidden p-2 rounded-md text-gray-300 hover:bg-gray-700 transition duration-150">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"></path></svg>
+                </button>
+            </div>
+        </div>
+
+        <!-- Mobile Menu (Hidden by default) -->
+        <div id="mobile-menu" class="hidden md:hidden bg-gray-800 border-t border-gray-700">
+            <a href="#featured" class="block py-3 px-4 text-sm text-gray-300 hover:bg-gray-700 hover:text-red-400 transition duration-150">Featured</a>
+            <a href="#genres" class="block py-3 px-4 text-sm text-gray-300 hover:bg-gray-700 hover:text-red-400 transition duration-150">Genres</a>
+            <a href="#" class="block py-3 px-4 text-sm text-red-500 hover:bg-gray-700 hover:text-red-400 transition duration-150 font-bold">My List</a>
+        </div>
+    </header>
+
+    <!-- Hero Section: Search and Tagline -->
+    <section class="bg-gray-800 text-white py-16 sm:py-24 border-b border-gray-700" id="hero">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center">
+            <h1 class="text-4xl sm:text-5xl lg:text-6xl font-extrabold tracking-tight mb-4">
+                Discover the Next <span class="text-red-500 text-red-glow">Epic</span> Story.
+            </h1>
+            <p class="text-lg sm:text-xl text-gray-400 mb-8 max-w-3xl mx-auto">
+                Access thousands of manga titles, or upload your own to the public library.
+            </p>
+            
+            <!-- Search Bar (Placeholder) -->
+            <div class="max-w-xl mx-auto">
+                <div class="flex rounded-lg shadow-lg overflow-hidden">
+                    <input type="search" placeholder="Search by title or author..." class="w-full p-4 text-lg text-gray-800 focus:outline-none focus:ring-2 focus:ring-red-500 rounded-l-lg" />
+                    <button class="bg-red-600 text-white p-4 hover:bg-red-700 transition duration-300 font-semibold flex items-center justify-center rounded-r-lg">
+                        <svg class="w-6 h-6 mr-2 hidden sm:block" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+                        Search
+                    </button>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Genre Explorer Section -->
+    <section class="bg-gray-800 py-10 sm:py-12 border-t border-b border-gray-700" id="genres">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <h2 class="text-2xl font-bold text-white text-center mb-6">Filter by Genre</h2>
+
+            <div class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-7 gap-3">
+                
+                <!-- Filter Buttons - Call filterManga() with the exact genre name -->
+                <button onclick="filterManga('All')" class="genre-btn bg-red-600 text-white p-3 rounded-lg font-medium hover:bg-red-700 transition duration-300 shadow-md">All</button>
+                <button onclick="filterManga('Shonen')" class="genre-btn bg-gray-700 text-white p-3 rounded-lg font-medium hover:bg-red-600 transition duration-300 shadow-md">Shonen</button>
+                <button onclick="filterManga('Seinen')" class="genre-btn bg-gray-700 text-white p-3 rounded-lg font-medium hover:bg-red-600 transition duration-300 shadow-md">Seinen</button>
+                <button onclick="filterManga('Romance')" class="genre-btn bg-gray-700 text-white p-3 rounded-lg font-medium hover:bg-red-600 transition duration-300 shadow-md">Romance</button>
+                <button onclick="filterManga('Horror')" class="genre-btn bg-gray-700 text-white p-3 rounded-lg font-medium hover:bg-red-600 transition duration-300 shadow-md">Horror</button>
+                <button onclick="filterManga('Sci-Fi')" class="genre-btn bg-gray-700 text-white p-3 rounded-lg font-medium hover:bg-red-600 transition duration-300 shadow-md">Sci-Fi</button>
+                <button onclick="filterManga('Fantasy')" class="genre-btn bg-gray-700 text-white p-3 rounded-lg font-medium hover:bg-red-600 transition duration-300 shadow-md">Fantasy</button>
+            </div>
+        </div>
+    </section>
+
+    <!-- Featured Titles Section (DYNAMIC MANGA GRID) -->
+    <section class="py-16 sm:py-24" id="featured">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <h2 class="text-3xl font-bold text-white text-center mb-12 border-b border-red-500 pb-3 inline-block mx-auto">🔥 User-Uploaded Titles</h2>
+
+            <!-- This grid content is loaded dynamically by JavaScript from Firestore -->
+            <div id="manga-grid" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 xl:grid-cols-6 gap-6 min-h-[300px]">
+                <p class="text-center text-gray-400 col-span-full py-10">Loading titles from the Archive...</p>
+            </div>
+            
+        </div>
+    </section>
+
+    <!-- Footer -->
+    <footer class="bg-gray-900 text-white py-8 border-t border-gray-700">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center">
+            <!-- User ID Display (MANDATORY for multi-user apps) -->
+            <p id="user-id-display" class="text-xs text-gray-500 mb-4 cursor-default" title="Your unique ID for this app."></p>
+            
+            <p class="text-sm text-gray-500">&copy; 2025 Manga Archive. All rights reserved.</p>
+        </div>
+    </footer>
+</body>
+</html>
+
